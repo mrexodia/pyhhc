@@ -7,16 +7,40 @@ import time
 from pathlib import Path
 
 from .chm import compile_chm
+from .lzx import LEVEL_BEST, LEVEL_FAST, LEVEL_NORMAL
 from .project import HHPProject
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("Usage: pyhhc <project.hhp>")
+    args = sys.argv[1:]
+    level = LEVEL_NORMAL
+    if "--fast" in args:
+        args.remove("--fast")
+        level = LEVEL_FAST
+    if "--best" in args:
+        args.remove("--best")
+        level = LEVEL_BEST
+
+    workers: int | None = 1
+    for flag in ("-j", "--jobs"):
+        if flag in args:
+            idx = args.index(flag)
+            args.pop(idx)
+            if idx < len(args) and args[idx].isdigit():
+                workers = int(args.pop(idx))
+            else:
+                workers = None  # auto-detect from CPU count
+
+    if len(args) != 1:
+        print("Usage: pyhhc [--fast|--best] [-j [N]] <project.hhp>")
         print("Compiles an HTML Help project (.hhp) into a .chm file.")
+        print("  --fast    compress faster at a slightly worse ratio")
+        print("  --best    compress better at the cost of speed")
+        print("  -j [N]    compress with N parallel processes")
+        print("            (N defaults to the CPU count; omit -j to run serial)")
         return 1
 
-    hhp_path = Path(sys.argv[1])
+    hhp_path = Path(args[0])
     if not hhp_path.exists():
         print(f"Error: file not found: {hhp_path}")
         return 1
@@ -34,7 +58,7 @@ def main() -> int:
     def progress(msg: str) -> None:
         print(f"  {msg}")
 
-    output = compile_chm(project, on_progress=progress)
+    output = compile_chm(project, on_progress=progress, level=level, workers=workers)
     elapsed = time.time() - start
 
     print(f"Created {output} in {elapsed:.2f}s")
