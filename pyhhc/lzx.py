@@ -14,7 +14,9 @@ translates; repeated distances are mapped onto LZX repeat offsets.
 from __future__ import annotations
 
 import os
+import sys
 import zlib
+from array import array
 from collections.abc import Callable
 
 NUM_CHARS = 256
@@ -81,10 +83,12 @@ def _find_position_slot(offset: int) -> int:
 
 
 class _BitWriter:
-    __slots__ = ("_bitbuf", "_bitcount", "buf")
+    """Accumulates the LZX bitstream as 16-bit little-endian words."""
+
+    __slots__ = ("_bitbuf", "_bitcount", "words")
 
     def __init__(self) -> None:
-        self.buf = bytearray()
+        self.words = array("H")
         self._bitbuf = 0
         self._bitcount = 0
 
@@ -93,9 +97,7 @@ class _BitWriter:
         self._bitcount += nbits
         while self._bitcount >= 16:
             self._bitcount -= 16
-            word = (self._bitbuf >> self._bitcount) & 0xFFFF
-            self.buf.append(word & 0xFF)
-            self.buf.append((word >> 8) & 0xFF)
+            self.words.append((self._bitbuf >> self._bitcount) & 0xFFFF)
         if self._bitcount > 0:
             self._bitbuf &= (1 << self._bitcount) - 1
         else:
@@ -106,7 +108,14 @@ class _BitWriter:
             self.write_bits(16 - self._bitcount, 0)
 
     def tell(self) -> int:
-        return len(self.buf)
+        return 2 * len(self.words)
+
+    def getvalue(self) -> bytes:
+        words = self.words
+        if sys.byteorder == "big":
+            words = array("H", words)
+            words.byteswap()
+        return words.tobytes()
 
 
 def _build_huffman(freqs: list[int]) -> tuple[list[int], list[int]]:
@@ -224,12 +233,6 @@ def _assign_codes(lengths: list[int], codes: list[int], n: int) -> None:
         cur_code += 1
 
 
-_LIT = 0
-_R0 = 1
-_R1 = 2
-_R2 = 3
-_MATCH = 4
-
 # -- DEFLATE stream parsing (RFC 1951) ------------------------------------
 # zlib does the match finding at C speed; we only decode its token stream.
 
@@ -261,10 +264,14 @@ def _bitrev(v: int, n: int) -> int:
 
 def _build_decode_table(
     lengths: list[int],
-) -> tuple[list[tuple[int, int] | None], dict[tuple[int, int], int]]:
+) -> tuple[list[int], dict[tuple[int, int], int]]:
     """Build a flat lookup table for the first _DECODE_ROOT bits; codes
-    longer than that go into a dict keyed by (length, code)."""
-    table: list[tuple[int, int] | None] = [None] * (1 << _DECODE_ROOT)
+    longer than that go into a dict keyed by (length, code).
+
+    Table entries are (symbol << 4) | code_length packed in one int, with
+    0 meaning "not in table" (valid entries always have a nonzero length).
+    """
+    table: list[int] = [0] * (1 << _DECODE_ROOT)
     longer: dict[tuple[int, int], int] = {}
     max_len = max(lengths) if lengths else 0
     bl_count = [0] * (max_len + 1)
@@ -284,8 +291,9 @@ def _build_decode_table(
         if length <= _DECODE_ROOT:
             rev = _bitrev(c, length)
             step = 1 << length
+            entry = (sym << 4) | length
             for f in range(rev, 1 << _DECODE_ROOT, step):
-                table[f] = (sym, length)
+                table[f] = entry
         else:
             longer[(length, c)] = sym
     return table, longer
@@ -305,19 +313,49 @@ def _read_long_code(
             return longer[(ln, code)], ln
 
 
-def _inflate_tokens(comp: bytes) -> list[int | tuple[int, int]]:
-    """Parse a raw DEFLATE stream into its LZ77 tokens.
+def _transcode(
+    block: bytes,
+    comp: bytes,
+    r0: int,
+    r1: int,
+    r2: int,
+    base: int,
+    main_tree_size: int,
+) -> tuple[list[int], list[int], list[int], int, int, int]:
+    """Parse a raw DEFLATE stream of `block` and convert it to packed LZX
+    tokens in a single pass.
 
-    Returns a list where each element is a literal byte value (int) or a
-    (length, distance) pair.
+    Packed token layout: a literal is just its byte value (< 256); a match
+    packs everything the encoder needs into one int:
+      bits 0..9   main tree symbol
+      bits 10..17 secondary length tree symbol (if bit 18 is set)
+      bit  18     has secondary length symbol
+      bits 19..23 offset extra-bit count
+      bits 24..40 offset extra-bit value
+      bits 41..   match length
+    Symbol frequencies for the Huffman trees are counted on the fly, so
+    the encoder does not need a separate counting pass over the tokens.
+    Returns (tokens, main_freqs, len_freqs, r0, r1, r2).
     """
-    data = comp + b"\x00" * 8
+    data = comp + b"\x00" * 32
     pos = 0
     acc = 0
     nbits = 0
-    tokens: list[int | tuple[int, int]] = []
+    tokens: list[int] = []
     append = tokens.append
+    mf = [0] * main_tree_size
+    lf = [0] * NUM_SECONDARY_LENGTHS
     root_mask = (1 << _DECODE_ROOT) - 1
+    slot_table = _slot_table
+    pos_base = _position_base
+    slot_extra = _extra_bits
+    len_base = _LEN_BASE
+    len_extra = _LEN_EXTRA
+    dist_base = _DIST_BASE
+    dist_extra = _DIST_EXTRA
+    from_bytes = int.from_bytes
+    frame_mask = FRAME_SIZE - 1
+    out_pos = 0  # position within block
 
     while True:
         while nbits < 3:
@@ -329,14 +367,17 @@ def _inflate_tokens(comp: bytes) -> list[int | tuple[int, int]]:
         acc >>= 3
         nbits -= 3
 
-        if btype == 0:  # stored block, byte-aligned
+        if btype == 0:  # stored block, byte-aligned: all literals
             pos -= nbits >> 3
             acc = 0
             nbits = 0
             ln = data[pos] | (data[pos + 1] << 8)
             pos += 4
-            for k in range(ln):
-                append(data[pos + k])
+            chunk = data[pos : pos + ln]
+            tokens.extend(chunk)
+            for b in chunk:
+                mf[b] += 1
+            out_pos += ln
             pos += ln
         else:
             if btype == 1:
@@ -364,15 +405,16 @@ def _inflate_tokens(comp: bytes) -> list[int | tuple[int, int]]:
                 ctab, clong = _build_decode_table(clen)
                 lens: list[int] = []
                 while len(lens) < hlit + hdist:
-                    while nbits < 22:
-                        acc |= data[pos] << nbits
-                        nbits += 8
-                        pos += 1
+                    if nbits < 24:
+                        acc |= from_bytes(data[pos : pos + 4], "little") << nbits
+                        nbits += 32
+                        pos += 4
                     e = ctab[acc & root_mask]
-                    if e is None:
-                        sym, ln = _read_long_code(acc, clong)
+                    if e:
+                        sym = e >> 4
+                        ln = e & 15
                     else:
-                        sym, ln = e
+                        sym, ln = _read_long_code(acc, clong)
                     acc >>= ln
                     nbits -= ln
                     if sym < 16:
@@ -396,48 +438,102 @@ def _inflate_tokens(comp: bytes) -> list[int | tuple[int, int]]:
                 dist_tab, dist_long = _build_decode_table(lens[hlit:])
 
             while True:
-                # worst case: length code + extra + dist code + extra
-                while nbits < 48:
-                    acc |= data[pos] << nbits
-                    nbits += 8
-                    pos += 1
+                # worst case bits per token: length code + extra + distance
+                # code + extra; one bulk refill covers it
+                if nbits < 48:
+                    acc |= from_bytes(data[pos : pos + 6], "little") << nbits
+                    nbits += 48
+                    pos += 6
                 e = lit_tab[acc & root_mask]
-                if e is None:
-                    sym, ln = _read_long_code(acc, lit_long)
+                if e:
+                    sym = e >> 4
+                    ln = e & 15
                 else:
-                    sym, ln = e
+                    sym, ln = _read_long_code(acc, lit_long)
                 acc >>= ln
                 nbits -= ln
                 if sym < 256:
                     append(sym)
+                    mf[sym] += 1
+                    out_pos += 1
                     continue
                 if sym == 256:
                     break
                 li = sym - 257
-                length = _LEN_BASE[li]
-                eb = _LEN_EXTRA[li]
+                length = len_base[li]
+                eb = len_extra[li]
                 if eb:
                     length += acc & ((1 << eb) - 1)
                     acc >>= eb
                     nbits -= eb
                 e = dist_tab[acc & root_mask]
-                if e is None:
-                    dsym, ln = _read_long_code(acc, dist_long)
+                if e:
+                    dsym = e >> 4
+                    ln = e & 15
                 else:
-                    dsym, ln = e
+                    dsym, ln = _read_long_code(acc, dist_long)
                 acc >>= ln
                 nbits -= ln
-                dist = _DIST_BASE[dsym]
-                eb = _DIST_EXTRA[dsym]
+                dist = dist_base[dsym]
+                eb = dist_extra[dsym]
                 if eb:
                     dist += acc & ((1 << eb) - 1)
                     acc >>= eb
                     nbits -= eb
-                append((length, dist))
+
+                # convert to LZX: split at frame boundaries and max length,
+                # map repeated distances onto the repeat-offset registers
+                while length:
+                    btf = FRAME_SIZE - ((base + out_pos) & frame_mask)
+                    take = min(length, MAX_MATCH, btf)
+                    if take < MIN_MATCH:
+                        b = block[out_pos]
+                        append(b)
+                        mf[b] += 1
+                        out_pos += 1
+                        length -= 1
+                        continue
+                    if dist == r0:
+                        ps = 0
+                        ebc = 0
+                        ev = 0
+                    elif dist == r1:
+                        ps = 1
+                        ebc = 0
+                        ev = 0
+                        r0, r1 = r1, r0
+                    elif dist == r2:
+                        ps = 2
+                        ebc = 0
+                        ev = 0
+                        r0, r2 = r2, r0
+                    else:
+                        fo = dist + 2
+                        ps = slot_table[fo]
+                        ebc = slot_extra[ps]
+                        ev = fo - pos_base[ps]
+                        r2 = r1
+                        r1 = r0
+                        r0 = dist
+                    lh = take - MIN_MATCH
+                    if lh < NUM_PRIMARY_LENGTHS:
+                        ms = NUM_CHARS + ps * 8 + lh
+                        v = ms | (take << 41)
+                    else:
+                        ms = NUM_CHARS + ps * 8 + NUM_PRIMARY_LENGTHS
+                        ls = lh - NUM_PRIMARY_LENGTHS
+                        v = ms | (ls << 10) | (1 << 18) | (take << 41)
+                        lf[ls] += 1
+                    mf[ms] += 1
+                    if ebc:
+                        v |= (ebc << 19) | (ev << 24)
+                    append(v)
+                    out_pos += take
+                    length -= take
 
         if bfinal:
             break
-    return tokens
+    return tokens, mf, lf, r0, r1, r2
 
 
 class LZXCompressor:
@@ -475,84 +571,20 @@ class LZXCompressor:
         if not data:
             return
         z = zlib.compressobj(9, zlib.DEFLATED, -15)
-        stream = z.compress(data) + z.flush()
-        tokens = self._convert(data, _inflate_tokens(stream))
-        self._encode(data, tokens)
+        tokens, mf, lf, self._r0, self._r1, self._r2 = _transcode(
+            data,
+            z.compress(data) + z.flush(),
+            self._r0,
+            self._r1,
+            self._r2,
+            self._uncomp,
+            self.main_tree_size,
+        )
+        self._encode(data, tokens, mf, lf)
 
-    def _convert(
-        self, data: bytes, dtokens: list[int | tuple[int, int]]
-    ) -> list[tuple[int, ...]]:
-        """Translate DEFLATE tokens to LZX tokens.
-
-        Matches are split at frame boundaries and at LZX's maximum match
-        length; distances equal to a repeat-offset register are emitted
-        as the corresponding cheap repeat-offset match.
-        """
-        tokens: list[tuple[int, ...]] = []
-        append = tokens.append
-        r0 = self._r0
-        r1 = self._r1
-        r2 = self._r2
-        base = self._uncomp
-        frame_mask = FRAME_SIZE - 1
-        pos = 0
-        for t in dtokens:
-            if isinstance(t, int):
-                append((_LIT, t))
-                pos += 1
-                continue
-            length, dist = t
-            while length:
-                btf = FRAME_SIZE - ((base + pos) & frame_mask)
-                take = min(length, MAX_MATCH, btf)
-                if take < MIN_MATCH:
-                    append((_LIT, data[pos]))
-                    pos += 1
-                    length -= 1
-                    continue
-                if dist == r0:
-                    append((_R0, take, 0))
-                elif dist == r1:
-                    append((_R1, take, 0))
-                    r0, r1 = r1, r0
-                elif dist == r2:
-                    append((_R2, take, 0))
-                    r0, r2 = r2, r0
-                else:
-                    append((_MATCH, take, dist))
-                    r2 = r1
-                    r1 = r0
-                    r0 = dist
-                pos += take
-                length -= take
-        self._r0 = r0
-        self._r1 = r1
-        self._r2 = r2
-        return tokens
-
-    def _encode(self, data: bytes, tokens: list[tuple[int, ...]]) -> None:
-        mf = [0] * self.main_tree_size
-        lf = [0] * NUM_SECONDARY_LENGTHS
-
-        for tok in tokens:
-            if tok[0] == _LIT:
-                mf[tok[1]] += 1
-            else:
-                ml = tok[1]
-                ps = (
-                    (tok[0] - _R0)
-                    if tok[0] != _MATCH
-                    else (
-                        _slot_table[tok[2] + 2]
-                        if tok[2] + 2 < 0x20000
-                        else _find_position_slot(tok[2] + 2)
-                    )
-                )
-                lh = min(ml - MIN_MATCH, NUM_PRIMARY_LENGTHS)
-                mf[NUM_CHARS + ps * 8 + lh] += 1
-                if lh == NUM_PRIMARY_LENGTHS:
-                    lf[ml - MIN_MATCH - NUM_PRIMARY_LENGTHS] += 1
-
+    def _encode(
+        self, data: bytes, tokens: list[int], mf: list[int], lf: list[int]
+    ) -> None:
         ml_, mc = _build_huffman(mf)
         ll_, lc = _build_huffman(lf)
 
@@ -564,64 +596,43 @@ class LZXCompressor:
         self._write_tree(ml_[NUM_CHARS:], self._prev_main_len[NUM_CHARS:])
         self._write_tree(ll_, self._prev_sec_len)
 
-        # Token loop with the bit writer inlined: this is the hottest part
-        # of encoding, so bits are accumulated in locals and flushed to the
-        # buffer 16 at a time, syncing with the writer only at frame ends.
-        buf = w.buf
-        append_byte = buf.append
+        # Huffman entries packed as (length << 16) | code so the emit loop
+        # is one list index plus shifts; bits are accumulated in locals and
+        # flushed 16 at a time, syncing with the writer only at frame ends.
+        pm = [(ml_[i] << 16) | mc[i] for i in range(len(ml_))]
+        pl = [(ll_[i] << 16) | lc[i] for i in range(len(ll_))]
+
+        words = w.words
+        append_word = words.append
         bitbuf = w._bitbuf
         bitcount = w._bitcount
         uncomp = self._uncomp
         next_frame = self._next_frame
         on_frame = self.on_frame
-        slot_table = _slot_table
-        eb_table = _extra_bits
-        base_table = _position_base
 
-        for tok in tokens:
-            if tok[0] == _LIT:
-                s = tok[1]
-                bitbuf = (bitbuf << ml_[s]) | mc[s]
-                bitcount += ml_[s]
+        for v in tokens:
+            if v < 256:
+                p = pm[v]
+                bitbuf = (bitbuf << (p >> 16)) | (p & 0xFFFF)
+                bitcount += p >> 16
                 uncomp += 1
             else:
-                ml = tok[1]
-                if tok[0] == _MATCH:
-                    fo = tok[2] + 2
-                    ps = (
-                        slot_table[fo]
-                        if fo < 0x20000
-                        else _find_position_slot(fo)
-                    )
-                else:
-                    ps = tok[0] - _R0
-                    fo = 0
-
-                lh = ml - MIN_MATCH
-                if lh >= NUM_PRIMARY_LENGTHS:
-                    ms = NUM_CHARS + ps * 8 + NUM_PRIMARY_LENGTHS
-                    bitbuf = (bitbuf << ml_[ms]) | mc[ms]
-                    bitcount += ml_[ms]
-                    ls = lh - NUM_PRIMARY_LENGTHS
-                    bitbuf = (bitbuf << ll_[ls]) | lc[ls]
-                    bitcount += ll_[ls]
-                else:
-                    ms = NUM_CHARS + ps * 8 + lh
-                    bitbuf = (bitbuf << ml_[ms]) | mc[ms]
-                    bitcount += ml_[ms]
-
-                eb = eb_table[ps]
-                if eb > 0:
-                    bitbuf = (bitbuf << eb) | (fo - base_table[ps])
+                p = pm[v & 1023]
+                bitbuf = (bitbuf << (p >> 16)) | (p & 0xFFFF)
+                bitcount += p >> 16
+                if v & 0x40000:
+                    p = pl[(v >> 10) & 255]
+                    bitbuf = (bitbuf << (p >> 16)) | (p & 0xFFFF)
+                    bitcount += p >> 16
+                eb = (v >> 19) & 31
+                if eb:
+                    bitbuf = (bitbuf << eb) | ((v >> 24) & 0x1FFFF)
                     bitcount += eb
-
-                uncomp += ml
+                uncomp += v >> 41
 
             while bitcount >= 16:
                 bitcount -= 16
-                word = (bitbuf >> bitcount) & 0xFFFF
-                append_byte(word & 0xFF)
-                append_byte(word >> 8)
+                append_word((bitbuf >> bitcount) & 0xFFFF)
             bitbuf &= (1 << bitcount) - 1
 
             if uncomp >= next_frame:
@@ -631,7 +642,7 @@ class LZXCompressor:
                 bitbuf = w._bitbuf
                 bitcount = w._bitcount
                 if on_frame:
-                    on_frame(next_frame, len(buf))
+                    on_frame(next_frame, 2 * len(words))
                 next_frame += FRAME_SIZE
 
         w._bitbuf = bitbuf
@@ -688,7 +699,7 @@ class LZXCompressor:
 
     def finish(self) -> bytes:
         self._w.align()
-        return bytes(self._w.buf)
+        return self._w.getvalue()
 
     @property
     def total_uncompressed(self) -> int:
