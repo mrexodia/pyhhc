@@ -3,12 +3,18 @@
 Implements the LZX compression algorithm as used in Microsoft CHM files.
 Produces VERBATIM (type 1) blocks. No E8 x86 call translation.
 Matches are capped at frame boundaries for decompressor compatibility.
+
+Match finding is delegated to zlib (C speed): each reset-interval block
+is deflated, the DEFLATE stream is parsed back into its LZ77 token
+sequence, and the tokens are re-encoded as LZX. DEFLATE's 32KB window
+and 3..258 match lengths fit inside LZX's limits, so every token
+translates; repeated distances are mapped onto LZX repeat offsets.
 """
 
 from __future__ import annotations
 
 import os
-import struct
+import zlib
 from collections.abc import Callable
 
 NUM_CHARS = 256
@@ -19,22 +25,6 @@ NUM_SECONDARY_LENGTHS = 249
 PRETREE_SIZE = 20
 MAX_CODE_LENGTH = 16
 FRAME_SIZE = 0x8000
-
-# Match-finder tuning per compression level. Fields: depth (hash-chain
-# candidates tried per position), nice (match length that stops the
-# search), lazy (match length that skips the lazy one-byte-later probe),
-# sample_min/sample_step (inside matches at least sample_min long, only
-# every sample_step-th position is added to the hash chains).
-LEVEL_FAST = 1
-LEVEL_NORMAL = 2
-LEVEL_BEST = 3
-_LEVELS = {
-    LEVEL_FAST: (2, 32, 4, 8, 4),
-    LEVEL_NORMAL: (4, 32, 8, 8, 4),
-    LEVEL_BEST: (64, 128, 32, 16, 2),
-}
-# Length above which the chain search runs with reduced depth.
-GOOD_LENGTH = 32
 
 _position_base: list[int] = []
 _extra_bits: list[int] = []
@@ -240,15 +230,214 @@ _R1 = 2
 _R2 = 3
 _MATCH = 4
 
+# -- DEFLATE stream parsing (RFC 1951) ------------------------------------
+# zlib does the match finding at C speed; we only decode its token stream.
 
-def _should_reject(ml: int, foff: int) -> bool:
-    if ml < 2:
-        return True
-    if foff >= 64 and ml < 3:
-        return True
-    if foff >= 2048 and ml < 4:
-        return True
-    return foff >= 65536 and ml < 5
+_LEN_BASE = (3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43,
+             51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258)
+_LEN_EXTRA = (0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4,
+              4, 4, 4, 5, 5, 5, 5, 0)
+_DIST_BASE = (1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257,
+              385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289,
+              16385, 24577)
+_DIST_EXTRA = (0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9,
+               9, 10, 10, 11, 11, 12, 12, 13, 13)
+_CLEN_ORDER = (16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1,
+               15)
+
+_DECODE_ROOT = 10
+
+_FIXED_LIT_LENGTHS = [8] * 144 + [9] * 112 + [7] * 24 + [8] * 8
+_FIXED_DIST_LENGTHS = [5] * 30
+
+
+def _bitrev(v: int, n: int) -> int:
+    r = 0
+    for _ in range(n):
+        r = (r << 1) | (v & 1)
+        v >>= 1
+    return r
+
+
+def _build_decode_table(
+    lengths: list[int],
+) -> tuple[list[tuple[int, int] | None], dict[tuple[int, int], int]]:
+    """Build a flat lookup table for the first _DECODE_ROOT bits; codes
+    longer than that go into a dict keyed by (length, code)."""
+    table: list[tuple[int, int] | None] = [None] * (1 << _DECODE_ROOT)
+    longer: dict[tuple[int, int], int] = {}
+    max_len = max(lengths) if lengths else 0
+    bl_count = [0] * (max_len + 1)
+    for length in lengths:
+        if length:
+            bl_count[length] += 1
+    code = 0
+    next_code = [0] * (max_len + 2)
+    for bits in range(1, max_len + 1):
+        code = (code + bl_count[bits - 1]) << 1
+        next_code[bits] = code
+    for sym, length in enumerate(lengths):
+        if not length:
+            continue
+        c = next_code[length]
+        next_code[length] += 1
+        if length <= _DECODE_ROOT:
+            rev = _bitrev(c, length)
+            step = 1 << length
+            for f in range(rev, 1 << _DECODE_ROOT, step):
+                table[f] = (sym, length)
+        else:
+            longer[(length, c)] = sym
+    return table, longer
+
+
+def _read_long_code(
+    acc: int, longer: dict[tuple[int, int], int]
+) -> tuple[int, int]:
+    """Decode a code longer than the root table covers, bit by bit."""
+    code = 0
+    ln = 0
+    while True:
+        code = (code << 1) | (acc & 1)
+        acc >>= 1
+        ln += 1
+        if ln > _DECODE_ROOT and (ln, code) in longer:
+            return longer[(ln, code)], ln
+
+
+def _inflate_tokens(comp: bytes) -> list[int | tuple[int, int]]:
+    """Parse a raw DEFLATE stream into its LZ77 tokens.
+
+    Returns a list where each element is a literal byte value (int) or a
+    (length, distance) pair.
+    """
+    data = comp + b"\x00" * 8
+    pos = 0
+    acc = 0
+    nbits = 0
+    tokens: list[int | tuple[int, int]] = []
+    append = tokens.append
+    root_mask = (1 << _DECODE_ROOT) - 1
+
+    while True:
+        while nbits < 3:
+            acc |= data[pos] << nbits
+            nbits += 8
+            pos += 1
+        bfinal = acc & 1
+        btype = (acc >> 1) & 3
+        acc >>= 3
+        nbits -= 3
+
+        if btype == 0:  # stored block, byte-aligned
+            pos -= nbits >> 3
+            acc = 0
+            nbits = 0
+            ln = data[pos] | (data[pos + 1] << 8)
+            pos += 4
+            for k in range(ln):
+                append(data[pos + k])
+            pos += ln
+        else:
+            if btype == 1:
+                lit_tab, lit_long = _build_decode_table(_FIXED_LIT_LENGTHS)
+                dist_tab, dist_long = _build_decode_table(_FIXED_DIST_LENGTHS)
+            else:
+                while nbits < 14:
+                    acc |= data[pos] << nbits
+                    nbits += 8
+                    pos += 1
+                hlit = (acc & 31) + 257
+                hdist = ((acc >> 5) & 31) + 1
+                hclen = ((acc >> 10) & 15) + 4
+                acc >>= 14
+                nbits -= 14
+                clen = [0] * 19
+                for i in range(hclen):
+                    while nbits < 3:
+                        acc |= data[pos] << nbits
+                        nbits += 8
+                        pos += 1
+                    clen[_CLEN_ORDER[i]] = acc & 7
+                    acc >>= 3
+                    nbits -= 3
+                ctab, clong = _build_decode_table(clen)
+                lens: list[int] = []
+                while len(lens) < hlit + hdist:
+                    while nbits < 22:
+                        acc |= data[pos] << nbits
+                        nbits += 8
+                        pos += 1
+                    e = ctab[acc & root_mask]
+                    if e is None:
+                        sym, ln = _read_long_code(acc, clong)
+                    else:
+                        sym, ln = e
+                    acc >>= ln
+                    nbits -= ln
+                    if sym < 16:
+                        lens.append(sym)
+                    elif sym == 16:
+                        rep = (acc & 3) + 3
+                        acc >>= 2
+                        nbits -= 2
+                        lens.extend([lens[-1]] * rep)
+                    elif sym == 17:
+                        rep = (acc & 7) + 3
+                        acc >>= 3
+                        nbits -= 3
+                        lens.extend([0] * rep)
+                    else:
+                        rep = (acc & 127) + 11
+                        acc >>= 7
+                        nbits -= 7
+                        lens.extend([0] * rep)
+                lit_tab, lit_long = _build_decode_table(lens[:hlit])
+                dist_tab, dist_long = _build_decode_table(lens[hlit:])
+
+            while True:
+                # worst case: length code + extra + dist code + extra
+                while nbits < 48:
+                    acc |= data[pos] << nbits
+                    nbits += 8
+                    pos += 1
+                e = lit_tab[acc & root_mask]
+                if e is None:
+                    sym, ln = _read_long_code(acc, lit_long)
+                else:
+                    sym, ln = e
+                acc >>= ln
+                nbits -= ln
+                if sym < 256:
+                    append(sym)
+                    continue
+                if sym == 256:
+                    break
+                li = sym - 257
+                length = _LEN_BASE[li]
+                eb = _LEN_EXTRA[li]
+                if eb:
+                    length += acc & ((1 << eb) - 1)
+                    acc >>= eb
+                    nbits -= eb
+                e = dist_tab[acc & root_mask]
+                if e is None:
+                    dsym, ln = _read_long_code(acc, dist_long)
+                else:
+                    dsym, ln = e
+                acc >>= ln
+                nbits -= ln
+                dist = _DIST_BASE[dsym]
+                eb = _DIST_EXTRA[dsym]
+                if eb:
+                    dist += acc & ((1 << eb) - 1)
+                    acc >>= eb
+                    nbits -= eb
+                append((length, dist))
+
+        if bfinal:
+            break
+    return tokens
 
 
 class LZXCompressor:
@@ -256,10 +445,8 @@ class LZXCompressor:
         self,
         window_bits: int = 16,
         on_frame: Callable[[int, int], None] | None = None,
-        level: int = LEVEL_NORMAL,
     ) -> None:
         _init_tables()
-        self.tuning = _LEVELS[level]
         self.window_bits = window_bits
         self.window_size = 1 << window_bits
         self.num_pos_slots = _num_position_slots(window_bits)
@@ -284,195 +471,60 @@ class LZXCompressor:
         self._w.write_bits(1, 0)
 
     def compress(self, data: bytes) -> None:
+        """Compress a chunk: zlib finds the matches, we re-encode as LZX."""
         if not data:
             return
-        tokens = self._lz(data)
+        z = zlib.compressobj(9, zlib.DEFLATED, -15)
+        stream = z.compress(data) + z.flush()
+        tokens = self._convert(data, _inflate_tokens(stream))
         self._encode(data, tokens)
 
-    def _lz(self, data: bytes) -> list[tuple[int, ...]]:
-        n = len(data)
-        if n == 0:
-            return []
+    def _convert(
+        self, data: bytes, dtokens: list[int | tuple[int, int]]
+    ) -> list[tuple[int, ...]]:
+        """Translate DEFLATE tokens to LZX tokens.
 
+        Matches are split at frame boundaries and at LZX's maximum match
+        length; distances equal to a repeat-offset register are emitted
+        as the corresponding cheap repeat-offset match.
+        """
         tokens: list[tuple[int, ...]] = []
         append = tokens.append
-        head: dict[int, int] = {}
-        prev = [-1] * n
-        # Last position with a full 4-byte key (exclusive bound). Keys are
-        # the 4 bytes at each position as little-endian ints, built in bulk
-        # with four strided unpacks instead of one slice per position.
-        nk = n - 3 if n >= 4 else 0
-        keys = [0] * nk
-        for r in range(min(4, nk)):
-            cnt = (nk - r + 3) // 4
-            vals = struct.unpack_from(f"<{(n - r) // 4}I", data, r)
-            keys[r::4] = vals[:cnt]
-
         r0 = self._r0
         r1 = self._r1
         r2 = self._r2
-        uncomp_base = self._uncomp
-        next_frame = self._next_frame
-        wsize = self.window_size
-
-        depth_max, nice_len, lazy_skip, sample_min, sample_step = self.tuning
-        good_len = GOOD_LENGTH
-        head_get = head.get
-
-        def find(i: int, max_len: int) -> tuple[int, int, int]:
-            """Best match at i as (length, kind, dist); kind is rep index 0-2
-            or 3 for a normal match, -1 for none (length 0)."""
-            best_len = MIN_MATCH - 1
-            kind = -1
-            dist = 0
-            for ri, roff in ((0, r0), (1, r1), (2, r2)):
-                if 0 < roff <= i:
-                    s = i - roff
-                    if data[i] != data[s]:
-                        continue
-                    ml = 0
-                    while (
-                        ml + 8 <= max_len
-                        and data[i + ml : i + ml + 8] == data[s + ml : s + ml + 8]
-                    ):
-                        ml += 8
-                    while ml < max_len and data[i + ml] == data[s + ml]:
-                        ml += 1
-                    if ml > best_len:
-                        best_len = ml
-                        kind = ri
-                        if ml >= max_len:
-                            return best_len, kind, 0
-            if i < nk and best_len < max_len:
-                depth = depth_max if best_len < good_len else depth_max >> 2
-                p = head_get(keys[i], -1)
-                while p >= 0 and depth > 0:
-                    if i - p > wsize:
-                        break
-                    if data[p + best_len] == data[i + best_len]:
-                        ml = 0
-                        while (
-                            ml + 8 <= max_len
-                            and data[i + ml : i + ml + 8] == data[p + ml : p + ml + 8]
-                        ):
-                            ml += 8
-                        while ml < max_len and data[i + ml] == data[p + ml]:
-                            ml += 1
-                        # A repeat offset is much cheaper to encode than a
-                        # far normal match, so require a margin to displace
-                        # a rep candidate.
-                        if ml > best_len + (1 if 0 <= kind <= 2 else 0):
-                            d = i - p
-                            if not _should_reject(ml, d + 2):
-                                best_len = ml
-                                kind = 3
-                                dist = d
-                                if ml >= nice_len or best_len >= max_len:
-                                    break
-                    p = prev[p]
-                    depth -= 1
-            if kind < 0 or best_len < MIN_MATCH:
-                return 0, -1, 0
-            return best_len, kind, dist
-
-        i = 0
-        have_prev = False
-        prev_len = 0
-        prev_kind = -1
-        prev_dist = 0
-        while i < n:
-            btf = next_frame - uncomp_base - i
-            if btf <= 0:
-                btf += FRAME_SIZE * ((-btf) // FRAME_SIZE + 1)
-            max_len = min(MAX_MATCH, n - i, btf)
-
-            cur_len = 0
-            cur_kind = -1
-            cur_dist = 0
-            if max_len >= MIN_MATCH:
-                # Only run the full search when either the hash table or a
-                # repeat offset can possibly match here.
-                b = data[i]
-                if (
-                    (i < nk and head_get(keys[i], -1) >= 0)
-                    or (0 < r0 <= i and b == data[i - r0])
-                    or (0 < r1 <= i and b == data[i - r1])
-                    or (0 < r2 <= i and b == data[i - r2])
-                ):
-                    cur_len, cur_kind, cur_dist = find(i, max_len)
-
-            if have_prev and prev_len >= cur_len and prev_len >= MIN_MATCH:
-                # The match found at i-1 wins over the one here: emit it.
-                if prev_kind == 3:
-                    r2 = r1
-                    r1 = r0
-                    r0 = prev_dist
-                    append((_MATCH, prev_len, prev_dist))
-                elif prev_kind == 0:
-                    append((_R0, prev_len, 0))
-                elif prev_kind == 1:
-                    r0, r1 = r1, r0
-                    append((_R1, prev_len, 0))
-                else:
-                    r0, r2 = r2, r0
-                    append((_R2, prev_len, 0))
-                end = i - 1 + prev_len
-                lim = min(end - 1, nk - 1)
-                step = 1 if prev_len < sample_min else sample_step
-                for j in range(i, lim + 1, step):
-                    k = keys[j]
-                    prev[j] = head_get(k, -1)
-                    head[k] = j
-                i = end
-                have_prev = False
-            elif not have_prev and cur_len >= lazy_skip:
-                # Long enough that a one-byte-later improvement is unlikely:
-                # emit directly and skip the lazy probe at i+1.
-                if cur_kind == 3:
-                    r2 = r1
-                    r1 = r0
-                    r0 = cur_dist
-                    append((_MATCH, cur_len, cur_dist))
-                elif cur_kind == 0:
-                    append((_R0, cur_len, 0))
-                elif cur_kind == 1:
-                    r0, r1 = r1, r0
-                    append((_R1, cur_len, 0))
-                else:
-                    r0, r2 = r2, r0
-                    append((_R2, cur_len, 0))
-                end = i + cur_len
-                lim = min(end - 1, nk - 1)
-                step = 1 if cur_len < sample_min else sample_step
-                for j in range(i, lim + 1, step):
-                    k = keys[j]
-                    prev[j] = head_get(k, -1)
-                    head[k] = j
-                i = end
-            else:
-                if have_prev:
-                    append((_LIT, data[i - 1]))
-                elif cur_len < MIN_MATCH:
-                    # No pending token and nothing found here: emit directly
-                    # instead of carrying a known-empty pending slot.
-                    append((_LIT, data[i]))
-                    if i < nk:
-                        k = keys[i]
-                        prev[i] = head_get(k, -1)
-                        head[k] = i
-                    i += 1
+        base = self._uncomp
+        frame_mask = FRAME_SIZE - 1
+        pos = 0
+        for t in dtokens:
+            if isinstance(t, int):
+                append((_LIT, t))
+                pos += 1
+                continue
+            length, dist = t
+            while length:
+                btf = FRAME_SIZE - ((base + pos) & frame_mask)
+                take = min(length, MAX_MATCH, btf)
+                if take < MIN_MATCH:
+                    append((_LIT, data[pos]))
+                    pos += 1
+                    length -= 1
                     continue
-                have_prev = True
-                prev_len, prev_kind, prev_dist = cur_len, cur_kind, cur_dist
-                if i < nk:
-                    k = keys[i]
-                    prev[i] = head_get(k, -1)
-                    head[k] = i
-                i += 1
-
-        if have_prev:
-            append((_LIT, data[n - 1]))
-
+                if dist == r0:
+                    append((_R0, take, 0))
+                elif dist == r1:
+                    append((_R1, take, 0))
+                    r0, r1 = r1, r0
+                elif dist == r2:
+                    append((_R2, take, 0))
+                    r0, r2 = r2, r0
+                else:
+                    append((_MATCH, take, dist))
+                    r2 = r1
+                    r1 = r0
+                    r0 = dist
+                pos += take
+                length -= take
         self._r0 = r0
         self._r1 = r1
         self._r2 = r2
@@ -644,7 +696,7 @@ class LZXCompressor:
 
 
 def _compress_block(
-    args: tuple[bytes, int, int],
+    args: tuple[bytes, int],
 ) -> tuple[bytes, list[int]]:
     """Compress one reset-interval block as an independent bitstream.
 
@@ -652,13 +704,13 @@ def _compress_block(
     every reset boundary and frames are 16-bit aligned, so per-block
     outputs concatenate into the same stream serial compression makes.
     """
-    block, window_bits, level = args
+    block, window_bits = args
     positions: list[int] = []
 
     def on_frame(_uncomp: int, comp: int) -> None:
         positions.append(comp)
 
-    c = LZXCompressor(window_bits, on_frame, level)
+    c = LZXCompressor(window_bits, on_frame)
     c._w.write_bits(1, 0)
     c.compress(block)
     return c.finish(), positions
@@ -668,7 +720,6 @@ def lzx_compress(
     data: bytes,
     window_bits: int = 16,
     reset_interval: int = 2,
-    level: int = LEVEL_NORMAL,
     workers: int | None = 1,
 ) -> tuple[bytes, list[int], int]:
     """Compress data using LZX for CHM.
@@ -695,7 +746,7 @@ def lzx_compress(
                 results = list(
                     ex.map(
                         _compress_block,
-                        ((b, window_bits, level) for b in blocks),
+                        ((b, window_bits) for b in blocks),
                         chunksize=4,
                     )
                 )
@@ -718,7 +769,7 @@ def lzx_compress(
     def on_frame(_uncomp: int, comp: int) -> None:
         positions.append(comp)
 
-    c = LZXCompressor(window_bits, on_frame, level)
+    c = LZXCompressor(window_bits, on_frame)
     c._w.write_bits(1, 0)
 
     off = 0

@@ -7,20 +7,11 @@ import time
 from pathlib import Path
 
 from .chm import compile_chm
-from .lzx import LEVEL_BEST, LEVEL_FAST, LEVEL_NORMAL
 from .project import HHPProject
 
 
 def main() -> int:
     args = sys.argv[1:]
-    level = LEVEL_NORMAL
-    if "--fast" in args:
-        args.remove("--fast")
-        level = LEVEL_FAST
-    if "--best" in args:
-        args.remove("--best")
-        level = LEVEL_BEST
-
     workers: int | None = 1
     for flag in ("-j", "--jobs"):
         if flag in args:
@@ -32,10 +23,8 @@ def main() -> int:
                 workers = None  # auto-detect from CPU count
 
     if len(args) != 1:
-        print("Usage: pyhhc [--fast|--best] [-j [N]] <project.hhp>")
+        print("Usage: pyhhc [-j [N]] <project.hhp>")
         print("Compiles an HTML Help project (.hhp) into a .chm file.")
-        print("  --fast    compress faster at a slightly worse ratio")
-        print("  --best    compress better at the cost of speed")
         print("  -j [N]    compress with N parallel processes")
         print("            (N defaults to the CPU count; omit -j to run serial)")
         return 1
@@ -58,7 +47,7 @@ def main() -> int:
     def progress(msg: str) -> None:
         print(f"  {msg}")
 
-    output = compile_chm(project, on_progress=progress, level=level, workers=workers)
+    output = compile_chm(project, on_progress=progress, workers=workers)
     elapsed = time.time() - start
 
     print(f"Created {output} in {elapsed:.2f}s")

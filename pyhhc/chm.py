@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .btree import PROPERTY_DATA, build_keyword_links
 from .fts import build_fiftimain
-from .lzx import FRAME_SIZE, LEVEL_NORMAL, lzx_compress
+from .lzx import FRAME_SIZE, lzx_compress
 from .project import HHPProject
 from .sitemap import SiteMapItem, parse_sitemap
 
@@ -3432,7 +3432,6 @@ def compile_chm(
     project: HHPProject,
     output_path: str | Path | None = None,
     on_progress: Callable[[str], None] | None = None,
-    level: int = LEVEL_NORMAL,
     workers: int | None = 1,
 ) -> Path:
     if output_path is None:
@@ -3668,7 +3667,7 @@ def compile_chm(
         on_progress(f"Compressing {len(all_sec1_data)} bytes with LZX...")
 
     compressed_data, frame_positions, total_uncomp = lzx_compress(
-        bytes(all_sec1_data), LZX_WINDOW_BITS, LZX_RESET_INTERVAL, level, workers
+        bytes(all_sec1_data), LZX_WINDOW_BITS, LZX_RESET_INTERVAL, workers
     )
 
     # -- Build section 0 (uncompressed) --
