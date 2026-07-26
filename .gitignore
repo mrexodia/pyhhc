@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# IDA Pro databases
+*.i64
+
+# Original Microsoft binaries (obtain separately)
+hha.dll
+hhc.exe
+itcc.dll
+buildchm.bat

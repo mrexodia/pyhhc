@@ -1,0 +1,41 @@
+[project]
+name = "pyhhc"
+version = "1.0.0"
+description = "Open-source Python reimplementation of Microsoft's HTML Help Compiler (hhc.exe)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSL-1.0"
+authors = [
+    { name = "Duncan Ogilvie" },
+]
+keywords = ["chm", "html-help", "hhc", "compiler"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Boost Software License 1.0 (BSL-1.0)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Documentation",
+    "Topic :: Software Development :: Build Tools",
+]
+dependencies = []
+
+[project.scripts]
+pyhhc = "pyhhc.cli:main"
+
+[project.urls]
+Repository = "https://github.com/mrexodia/pyhhc"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pyhhc"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["pyhhc", "README.md", "LICENSE"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

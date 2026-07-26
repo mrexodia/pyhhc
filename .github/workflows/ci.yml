@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish distributions to PyPI using trusted publishing"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: test and package
+    # Skip building pull requests from the same repository
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Update pyproject.toml version
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        shell: bash
+        run: |
+          # Extract version from tag (strip 'v' prefix if present)
+          VERSION=${GITHUB_REF#refs/tags/}
+          VERSION=${VERSION#v}
+          echo "Extracted version: $VERSION"
+
+          # Update version in pyproject.toml (works on both GNU and BSD sed)
+          sed -i.bak "s/^version = .*/version = \"$VERSION\"/" pyproject.toml
+          rm pyproject.toml.bak
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.10
+
+      - name: Install dependencies
+        run: uv sync --python 3.10
+
+      - name: Type check
+        run: uvx ty check
+
+      - name: Ruff check
+        run: uvx ruff check
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          mkdir smoke && cd smoke
+          cat > index.html <<'EOF'
+          <html><head><title>Test</title></head><body><h1>Hello</h1></body></html>
+          EOF
+          cat > test.hhp <<'EOF'
+          [OPTIONS]
+          Compiled file=test.chm
+          Default topic=index.html
+
+          [FILES]
+          index.html
+          EOF
+          uv run pyhhc test.hhp
+          test -f test.chm
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Check distribution metadata
+        run: uv run --with twine twine check dist/*
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/*
+
+  publish:
+    name: publish to PyPI
+    needs: package
+    runs-on: ubuntu-24.04
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Publish distributions
+        run: uv publish --trusted-publishing always dist/*
